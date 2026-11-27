@@ -7,6 +7,8 @@
 #
 # 注意：pull_request_target 和 issue_comment 都使用默认分支（main）上的工作流文件，
 #       所以本文件需先合入 main 才会生效。
+#       issue_comment 的运行默认挂在默认分支的提交上，不会出现在 PR 的 Checks 页，
+#       因此该路径会额外通过 Checks API 在 PR head SHA 上写入 check run，使其计入 PR 状态检查。
 name: Check PR has test.py
 
 on:
@@ -18,6 +20,12 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  # 用于在 PR head SHA 上写入 check run（issue_comment 路径）
+  checks: write
+
+env:
+  # 评论触发的检查在 PR Checks 页显示的名称；如需合并门禁，可在分支保护中勾选该名称
+  COMMENT_CHECK_NAME: check-test-py (comment)
 
 jobs:
   check-test-py:
@@ -36,6 +44,7 @@ jobs:
           echo "number=${NUM}" >> "$GITHUB_OUTPUT"
 
       - name: 检查 PR 变更中是否包含 test.py
+        id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -53,7 +62,53 @@ jobs:
           # 匹配任意目录下文件名为 test.py 的变更
           if echo "${FILES}" | grep -qE '(^|/)test\.py$'; then
             echo "成功：PR 中包含 test.py"
+            echo "result=success" >> "$GITHUB_OUTPUT"
           else
             echo "::error::失败：PR 中未找到 test.py 文件"
-            exit 1
+            echo "result=failure" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: 将结果回写为 PR head 上的 Check Run
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESULT: ${{ steps.check.outputs.result }}
+        run: |
+          PR="${{ steps.pr.outputs.number }}"
+          SHA=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" --jq '.head.sha')
+          echo "PR head SHA: ${SHA}"
+
+          if [ "${RESULT}" = "success" ]; then
+            TITLE="PR 中包含 test.py"
+          else
+            RESULT="failure"
+            TITLE="PR 中未找到 test.py"
+          fi
+
+          # 同一 SHA 上多次评论时更新已有 check run，避免出现多条同名记录
+          ID=$(gh api --method GET "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs" \
+            -f check_name="${COMMENT_CHECK_NAME}" \
+            -f filter=latest \
+            --jq '.check_runs[0].id // empty')
+
+          if [ -n "${ID}" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/check-runs/${ID}" \
+              -f status=completed \
+              -f conclusion="${RESULT}" \
+              -f "output[title]=${TITLE}" \
+              -f "output[summary]=由 PR 评论触发的检查，结果：${RESULT}" \
+              -f details_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs" \
+              -f name="${COMMENT_CHECK_NAME}" \
+              -f head_sha="${SHA}" \
+              -f status=completed \
+              -f conclusion="${RESULT}" \
+              -f "output[title]=${TITLE}" \
+              -f "output[summary]=由 PR 评论触发的检查，结果：${RESULT}" \
+              -f details_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi
+
+      - name: 检查未通过时退出
+        if: steps.check.outputs.result != 'success'
+        run: exit 1
