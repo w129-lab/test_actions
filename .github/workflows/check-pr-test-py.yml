@@ -1,0 +1,59 @@
+# 测试用 Action：检查 PR 变更中是否包含 test.py 文件
+#   包含 -> 成功；不包含 -> 失败（::error:: + exit 1）
+#
+# 触发方式：
+#   1. pull_request_target：PR 打开 / 更新 / 重新打开时
+#   2. PR 评论（issue_comment）：在 PR 上任意评论即触发（普通 issue 评论不会触发）
+#
+# 注意：pull_request_target 和 issue_comment 都使用默认分支（main）上的工作流文件，
+#       所以本文件需先合入 main 才会生效。
+name: Check PR has test.py
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check-test-py:
+    # issue_comment 只在 PR 上执行，普通 issue 的评论直接跳过
+    if: github.event_name == 'pull_request_target' || github.event.issue.pull_request != null
+    runs-on: ubuntu-latest
+    steps:
+      - name: 获取 PR 编号
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request_target" ]; then
+            NUM="${{ github.event.pull_request.number }}"
+          else
+            NUM="${{ github.event.issue.number }}"
+          fi
+          echo "number=${NUM}" >> "$GITHUB_OUTPUT"
+
+      - name: 检查 PR 变更中是否包含 test.py
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR="${{ steps.pr.outputs.number }}"
+          echo "读取 PR #${PR} 的变更文件列表..."
+          FILES=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[].filename')
+
+          if [ -z "${FILES}" ]; then
+            echo "PR 没有任何文件变更"
+          else
+            echo "变更文件："
+            echo "${FILES}"
+          fi
+
+          # 匹配任意目录下文件名为 test.py 的变更
+          if echo "${FILES}" | grep -qE '(^|/)test\.py$'; then
+            echo "成功：PR 中包含 test.py"
+          else
+            echo "::error::失败：PR 中未找到 test.py 文件"
+            exit 1
+          fi
